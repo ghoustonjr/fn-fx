@@ -4,10 +4,12 @@
            (javafx.stage Stage)
            (java.lang.reflect Method Modifier Constructor)
            (javafx.collections ObservableList)
-           (javafx.event EventHandler)
+           (javafx.event EventHandler EventType)
            (javafx.collections FXCollections)
            (java.util WeakHashMap List Collection)
-           (javafx.beans NamedArg))
+           (javafx.beans NamedArg)
+           (javafx.scene.input InputEvent)
+           (javafx.beans.value ChangeListener))
   (:require [fn-fx.util :as util]
             [fn-fx.diff :as diff]
             [clojure.set]))
@@ -67,6 +69,7 @@
   javafx.scene.layout.HBox
   javafx.scene.layout.StackPane
   javafx.scene.layout.GridPane
+  javafx.scene.layout.AnchorPane
   javafx.scene.text.Font
   javafx.scene.text.Text
   javafx.geometry.Insets
@@ -158,7 +161,6 @@
   (let [setters-and-getters (merge-with merge (find-setters tp) (find-getters tp))]
     setters-and-getters))
 
-; TODO: Probably needs something to handle constructor var-args too (see KeyFrame for an example of what I mean)
 (defn get-constructor [tp]
   (let [template-sym (gensym "template")
         ctors (sort-by (fn [[params _]] (count params)) > (annotated-constructors tp))
@@ -222,7 +224,6 @@
                     (case property#
                       ~@(apply concat clauses)
                       (println "Unknown property" property# " on " ~tp)))]
-
         (log form)
         (eval form)))))
 
@@ -315,7 +316,32 @@
 (defn convert-observable-list [itms]
   (FXCollections/observableArrayList ^Collection (mapv create-component itms)))
 
-(def ignore-properties #{:type :fn-fx/children :fn-fx/id})
+(defn create-change-listener
+  [tag]
+  (let [handler-atom *handler-atom*]
+    (reify ChangeListener
+      (changed [this obs old new]
+        (future (@handler-atom {:tag :fn-fx/observable-changed :new new :old old :name tag}))))))
+
+(defn observe
+  [obj path tag]
+  (let [obj-sym (gensym "obj")
+        path-elements (map (fn [elem]
+                             (list (symbol (str "get"
+                                                (Character/toUpperCase ^Character(first (name elem)))
+                                                (apply str (rest (name elem)))))))
+                           (butlast path))
+        observable (list (symbol (str (name (last path)) "Property")))
+        form `(fn [~obj-sym]
+                (.. ~obj-sym
+                    ~@path-elements
+                    ~observable
+                    ~(list (symbol "addListener")
+                           `(create-change-listener ~tag))))]
+    (log form)
+    ((eval form) obj)))
+
+(def ignore-properties #{:type :fn-fx/children :fn-fx/id :fn-fx/observe})
 
 (defn create-component [component]
   (let [ctor (get-ctor (:type component))
@@ -339,6 +365,12 @@
             ((get-static-setter tp) instance (name k) v))))
       nil
       component)
+    (when-let [observables (:fn-fx/observe component)]
+      (reduce-kv
+        (fn [_ k v]
+          (observe instance k v))
+        nil
+        observables))
     (when-let [id (:fn-fx/id component)]
       (.put ^WeakHashMap *id-map* id instance))
     instance))
