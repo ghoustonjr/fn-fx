@@ -1,4 +1,7 @@
 (ns fn-fx.render
+  (:require [fn-fx.util :as util]
+            [fn-fx.diff :as diff]
+            [clojure.set :refer [subset?]])
   (:import (javafx.embed.swing JFXPanel)
            (javafx.scene Scene)
            (javafx.stage Stage)
@@ -8,20 +11,16 @@
            (javafx.collections FXCollections)
            (java.util WeakHashMap List Collection)
            (javafx.beans NamedArg)
-           (javafx.scene.input InputEvent)
-           (javafx.beans.value ChangeListener))
-  (:require [fn-fx.util :as util]
-            [fn-fx.diff :as diff]
-            [clojure.set]))
+           (javafx.beans.value ChangeListener)
+           (java.lang.annotation Annotation)))
 
-(set! *warn-on-reflection* false)
+(set! *warn-on-reflection* true)
 
 (JFXPanel.)
-
-(def constructors (atom {}))
 (def types (atom {}))
 
 (def ^:dynamic *log* false)
+(def ^:dynamic *id-map*)
 
 (defn log [form]
   (when *log*
@@ -32,26 +31,23 @@
 (declare create-event-handler)
 
 (def converter-code (atom (partition-all 2 [Integer/TYPE `int
-                                            java.lang.Integer `int
+                                            Integer `int
                                             Double/TYPE `double
-                                            java.lang.Double `double
+                                            Double `double
                                             Boolean/TYPE `boolean
-                                            java.lang.Boolean `boolean
-                                            java.lang.String `str
+                                            Boolean `boolean
+                                            String `str
                                             EventHandler `create-event-handler
                                             ObservableList `convert-observable-list])))
 
 (defmacro import-components [& components]
   `(do ~@(for [component components]
-           (let [builder-name (symbol (str (name component)))
-                 kw-name (->> (.lastIndexOf (name component) ".")
+           (let [kw-name (->> (.lastIndexOf (name component) ".")
                               inc
                               (subs (name component))
-                              keyword)
-                 ]
+                              keyword)]
              `(do (clojure.core/import ~component)
                   (swap! converter-code conj [~component `create-component])
-                  (swap! constructors assoc ~kw-name ~builder-name)
                   (swap! types assoc ~kw-name ~component))))))
 
 (import-components
@@ -103,93 +99,91 @@
              (if (.isEnum to-tp)
                `(get-enum-converter ~to-tp)
                (if-let [converter (first (keep (fn [[^Class klass converter]]
-
                                                  (when (.isAssignableFrom to-tp klass)
                                                    converter))
                                                @converter-code))]
                  converter
                  `identity)))))
 
-(defn ctor-param-names
-  [ctor]
-  (map (fn [anns]
-         (if-let [ann (first (filter
-                               (fn [ann] (= NamedArg (.annotationType ann)))
-                               anns))]
-           (keyword (.value ann))))
-       (.getParameterAnnotations ctor)))
-
-(defn properly-annotated?
-  [ctor]
-  (some (fn [anns]
-          (some (fn [ann] (= NamedArg (.annotationType ann))) anns))
-        (.getParameterAnnotations ctor)))
-
-(defn annotated-constructors
-  [tp]
-  (into [] (map (juxt (comp set ctor-param-names) identity)) (filter (fn [ctor]
-                                                                       (or
-                                                                         (properly-annotated? ctor)
-                                                                         (zero? (.getParameterCount ctor))))
-                                                                     (.getConstructors tp))))
 (defn find-getters
-  [tp]
-  (into {} (for [m (.getMethods tp)
-                 :let [mn (.getName m)]
+  [^Class tp]
+  (into {} (for [^Method m (.getMethods tp)
+                 :let [^String mn (.getName m)]
                  :when (= 0 (.getParameterCount m))
                  :when (or (.startsWith mn "is") (.startsWith mn "get"))
+                 :when (not (contains? #{"getClass"} (.getName m)))
                  :let [prop-name (cond
                                    (.startsWith mn "is") (.substring mn 2)
                                    (.startsWith mn "get") (.substring mn 3))]]
-             [(keyword (apply str (Character/toLowerCase ^Character (first prop-name)) (rest prop-name)))
-              {:getter {:method m :name mn :ret-type (.getReturnType ^Method m)}}])))
+             (vector (keyword (apply str (Character/toLowerCase ^Character (first prop-name)) (rest prop-name)))
+                     {:getter {:method m :name mn :ret-type (.getReturnType ^Method m)}}))))
 
 (defn find-setters
-  [tp]
-  (into {} (for [m (.getMethods tp)
+  [^Class tp]
+  (into {} (for [^Method m (.getMethods tp)
                  :when (= 1 (.getParameterCount m))
-                 :let [mn (.getName m)]
+                 :let [^String mn (.getName m)]
                  :when (.startsWith mn "set")
                  :when (= Void/TYPE (.getReturnType m))
                  :let [prop-name (.substring mn 3)
                        ptype (aget (.getParameterTypes m) 0)]]
-             [(keyword (apply str (Character/toLowerCase ^Character (first prop-name)) (rest prop-name)))
-              {:setter {:method m :name mn :param-type ptype}}])))
+             (vector (keyword (apply str (Character/toLowerCase ^Character (first prop-name)) (rest prop-name)))
+                     {:setter {:method m :name mn :param-type ptype}}))))
 
 (defn get-properties
   [tp]
-  (let [setters-and-getters (merge-with merge (find-setters tp) (find-getters tp))]
-    setters-and-getters))
+  (merge-with merge (find-setters tp) (find-getters tp)))
 
-(defn get-constructor [tp]
-  (let [template-sym (gensym "template")
-        ctors (sort-by (fn [[params _]] (count params)) > (annotated-constructors tp))
-        clauses (for [ctor ctors] `(clojure.set/subset? ~(first ctor) ~template-sym))
-        exprs (for [ctor ctors] (let [ctor (second ctor)
-                                      ctor-symbol (symbol (.getName ctor))
-                                      args (ctor-param-names ctor)
-                                      arg-lookups (for [arg args] `(~arg ~template-sym))
-                                      arg-converters (map get-converter (apply vector (.getParameterTypes ^Constructor ctor)))
-                                      form `{:ctor-params (vector ~@args)
-                                             :object      (new ~ctor-symbol ~@(map (fn [c s] (list c s)) arg-converters arg-lookups))}]
-                                  form))
-        cond-body (interleave clauses exprs)
-        else-body `(:else "No valid constructor for the template provided!")
-        form `(fn [~template-sym]
-                (cond
-                  ~@cond-body
-                  ~@else-body))]
-    (log form)
-    (eval form)))
+(defn ctor-param-names
+  [^Constructor ctor]
+  (map (fn [anns]
+         (if-let [^NamedArg ann (first
+                                  (filter
+                                    (fn [^Annotation ann] (= NamedArg (.annotationType ann)))
+                                    anns))]
+           (keyword (.value ann))))
+       (.getParameterAnnotations ctor)))
 
-(def get-ctor
+(defn properly-annotated?
+  [^Constructor ctor]
+  (some (fn [anns]
+          (some (fn [^Annotation ann] (= NamedArg (.annotationType ann))) anns))
+        (.getParameterAnnotations ctor)))
+
+(defn viable-constructors
+  [^Class tp]
+  (map (fn [ctor]
+         {:params ((comp set ctor-param-names) ctor)
+          :ctor   ctor})
+       (filter (fn [^Constructor ctor]
+                 (or
+                   (properly-annotated? ctor)
+                   (zero? (.getParameterCount ctor))))
+               (.getConstructors tp))))
+
+(def get-constructor
   (memoize
-    (fn [nm]
-      (let [ctor (get-constructor (@constructors nm))
-            _ (assert ctor (str "No constructor for " nm))]
-        ctor))))
+    (fn [^Class tp]
+      (let [template-sym (gensym "template")
+            ctors (sort-by (comp count :params) > (viable-constructors tp))
+            tests (for [ctor ctors] `(subset? ~(:params ctor) ~template-sym))
+            exprs (for [ctor ctors] (let [^Constructor ctor (:ctor ctor)
+                                          ctor-symbol (symbol (.getName ctor))
+                                          args (ctor-param-names ctor)
+                                          arg-lookups (for [arg args] `(~arg ~template-sym))
+                                          arg-converters (map get-converter (apply vector (.getParameterTypes ^Constructor ctor)))
+                                          form `{:ctor-params (vector ~@args)
+                                                 :object      (new ~ctor-symbol ~@(map (fn [c s] (list c s)) arg-converters arg-lookups))}]
+                                      form))
+            cond-body (interleave tests exprs)
+            else-body `(:else (assert false "There is no valid constructor for the provided template."))
 
-(def ^:dynamic *id-map*)
+            form `(fn [~template-sym]
+                    (cond
+                      ~@cond-body
+                      ~@else-body))]
+        (log form)
+        (eval form)))))
 
 (def get-setter
   (memoize
@@ -203,7 +197,7 @@
                             (for [[prop-name prop-info] (get-properties tp)]
                               (cond
                                 (contains? prop-info :setter)
-                                (let [setter (get-in prop-info [:setter :method])
+                                (let [^Method setter (get-in prop-info [:setter :method])
                                       arg-type (aget (.getParameterTypes setter) 0)
                                       converter (get-converter arg-type)]
                                   `[~prop-name
@@ -213,13 +207,14 @@
                                                    {:tag arg-type}))])
                                 (and (contains? prop-info :getter)
                                      (isa? (get-in prop-info [:getter :ret-type]) Collection))
-                                (let [getter (get-in prop-info [:getter :method])
+                                (let [^Method getter (get-in prop-info [:getter :method])
                                       arg-type (.getReturnType getter)
                                       converter (get-converter arg-type)]
                                   `[~prop-name
                                     (.
                                       (. ~obj-sym ~(symbol (.getName getter)))
                                       ~(symbol "addAll") (~converter ~val-sym))]))))
+
             form `(fn [~obj-sym property# ~val-sym]
                     (case property#
                       ~@(apply concat clauses)
@@ -266,15 +261,10 @@
       (let [^Class tp tp
             obj-sym (with-meta (gensym "obj")
                                {:tag (symbol (.getName tp))})
-            clauses (for [m (.getMethods tp)
-                          :when (= (.getParameterCount ^Method m) 0)
-                          :when (.startsWith (.getName ^Method m) "get")
-                          :when (not (contains? #{"getClass"} (.getName ^Method m)))
-                          :let [prop-name (let [mn (subs (.getName ^Method m) 3)]
-                                            (str (.toLowerCase (subs mn 0 1)) (subs mn 1)))]]
-                      `[~(keyword prop-name)
+            clauses (for [[prop-name prop-info] (find-getters tp)]
+                      `[~prop-name
                         (. ~obj-sym
-                           ~(symbol (.getName ^Method m)))])
+                           ~(symbol (get-in prop-info [:getter :name])))])
             form `(fn [~obj-sym property#]
                     (case property#
                       ~@(apply concat clauses)
@@ -344,7 +334,9 @@
 (def ignore-properties #{:type :fn-fx/children :fn-fx/id :fn-fx/observe})
 
 (defn create-component [component]
-  (let [ctor (get-ctor (:type component))
+  (let [tp (get @types (:type component))
+        _ (assert tp (str "Tried to create a component with an unknown type: " (:type component)))
+        ctor (get-constructor tp)
         ctor-result (ctor component)
         instance (:object ctor-result)
         ctor-params (:ctor-params ctor-result)
@@ -457,8 +449,7 @@
     (diff/diff @state new-state))
   (update! [this new-state]
     (locking this
-      (let [changes (time (diff this new-state))
-            _ (println changes)]
+      (let [changes (time (diff this new-state))]
         (vreset! state new-state)
         (log changes)
         (util/run-later
